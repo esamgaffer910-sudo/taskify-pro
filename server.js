@@ -1,5 +1,5 @@
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 const path = require('path');
 const bcrypt = require('bcryptjs');
 
@@ -9,27 +9,40 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-const dbPath = path.join(__dirname, 'tasks.db');
-const db = new sqlite3.Database(dbPath, (err) => {
-    if (err) {
-        console.error('Error opening database:', err.message);
-    } else {
-        db.run(`CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL
-        )`);
-
-        db.run(`CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            text TEXT NOT NULL,
-            completed INTEGER DEFAULT 0,
-            last_completed_date TEXT,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )`);
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: {
+        rejectUnauthorized: false
     }
 });
+
+async function initDb() {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL
+            )
+        `);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS tasks (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                text TEXT NOT NULL,
+                completed INTEGER DEFAULT 0,
+                last_completed_date TEXT
+            )
+        `);
+
+        console.log('Connected to PostgreSQL and ensured tables exist.');
+    } catch (err) {
+        console.error('Error initializing database:', err.message);
+    }
+}
+
+initDb();
 
 app.post('/api/register', async (req, res) => {
     const { username, password } = req.body;
@@ -39,89 +52,121 @@ app.post('/api/register', async (req, res) => {
 
     try {
         const hashedPassword = await bcrypt.hash(password, 10);
-        db.run(`INSERT INTO users (username, password) VALUES (?, ?)`, [username, hashedPassword], function(err) {
-            if (err) {
-                return res.status(400).json({ error: 'Username already exists' });
-            }
-            res.json({ success: true, userId: this.lastID });
-        });
+        const result = await pool.query(
+            `INSERT INTO users (username, password) VALUES ($1, $2) RETURNING id`,
+            [username, hashedPassword]
+        );
+        res.json({ success: true, userId: result.rows[0].id });
+    } catch (err) {
+        if (err.code === '23505') {
+            return res.status(400).json({ error: 'Username already exists' });
+        }
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/login', async (req, res) => {
+    const { username, password } = req.body;
+
+    try {
+        const result = await pool.query(`SELECT * FROM users WHERE username = $1`, [username]);
+        const user = result.rows[0];
+
+        if (!user) {
+            return res.status(401).json({ error: 'Invalid username or password' });
+        }
+
+        const isMatch = await bcrypt.compare(password, user.password);
+        if (!isMatch) {
+            return res.status(401).json({ error: 'Invalid username or password' });
+        }
+
+        res.json({ success: true, userId: user.id, username: user.username });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-app.post('/api/login', (req, res) => {
-    const { username, password } = req.body;
-
-    db.get(`SELECT * FROM users WHERE username = ?`, [username], async (err, user) => {
-        if (err) return res.status(500).json({ error: err.message });
-        if (!user) return res.status(401).json({ error: 'Invalid username or password' });
-
-        try {
-            const isMatch = await bcrypt.compare(password, user.password);
-            if (!isMatch) {
-                return res.status(401).json({ error: 'Invalid username or password' });
-            }
-
-            res.json({ success: true, userId: user.id, username: user.username });
-        } catch (hashErr) {
-            res.status(500).json({ error: hashErr.message });
-        }
-    });
-});
-
-app.get('/api/tasks/:userId', (req, res) => {
+app.get('/api/tasks/:userId', async (req, res) => {
     const { userId } = req.params;
-    db.all('SELECT * FROM tasks WHERE user_id = ? ORDER BY id DESC', [userId], (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
 
+    try {
+        const result = await pool.query(
+            'SELECT * FROM tasks WHERE user_id = $1 ORDER BY id DESC',
+            [userId]
+        );
+        const rows = result.rows;
         const today = new Date().toISOString().split('T')[0];
-        rows.forEach(task => {
+
+        for (const task of rows) {
             if (task.completed === 1 && task.last_completed_date !== today) {
-                db.run(`UPDATE tasks SET completed = 0 WHERE id = ?`, [task.id]);
+                await pool.query(`UPDATE tasks SET completed = 0 WHERE id = $1`, [task.id]);
                 task.completed = 0;
             }
-        });
+        }
+
         res.json(rows);
-    });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
-app.post('/api/tasks', (req, res) => {
+app.post('/api/tasks', async (req, res) => {
     const { userId, text } = req.body;
-    if (!userId || !text) return res.status(400).json({ error: 'Missing data' });
+    if (!userId || !text) {
+        return res.status(400).json({ error: 'Missing data' });
+    }
 
-    db.run(`INSERT INTO tasks (user_id, text, completed, last_completed_date) VALUES (?, ?, 0, NULL)`, [userId, text], function(err) {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ id: this.lastID, text, completed: 0 });
-    });
+    try {
+        const result = await pool.query(
+            `INSERT INTO tasks (user_id, text, completed, last_completed_date)
+             VALUES ($1, $2, 0, NULL)
+             RETURNING id, text, completed`,
+            [userId, text]
+        );
+        res.json(result.rows[0]);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
-app.put('/api/tasks/:id', (req, res) => {
+app.put('/api/tasks/:id', async (req, res) => {
     const { id } = req.params;
     const { text, completed } = req.body;
     const today = new Date().toISOString().split('T')[0];
 
-    if (completed !== undefined) {
-        const newCompleted = completed ? 1 : 0;
-        const completionDate = newCompleted === 1 ? today : null;
-        db.run(`UPDATE tasks SET completed = ?, last_completed_date = ? WHERE id = ?`, [newCompleted, completionDate, id], function(err) {
-            if (err) return res.status(500).json({ error: err.message });
-            res.json({ updated: this.changes });
-        });
-    } else if (text !== undefined) {
-        db.run(`UPDATE tasks SET text = ? WHERE id = ?`, [text, id], function(err) {
-            if (err) return res.status(500).json({ error: err.message });
-            res.json({ updated: this.changes });
-        });
+    try {
+        if (completed !== undefined) {
+            const newCompleted = completed ? 1 : 0;
+            const completionDate = newCompleted === 1 ? today : null;
+            const result = await pool.query(
+                `UPDATE tasks SET completed = $1, last_completed_date = $2 WHERE id = $3`,
+                [newCompleted, completionDate, id]
+            );
+            res.json({ updated: result.rowCount });
+        } else if (text !== undefined) {
+            const result = await pool.query(
+                `UPDATE tasks SET text = $1 WHERE id = $2`,
+                [text, id]
+            );
+            res.json({ updated: result.rowCount });
+        } else {
+            res.json({ updated: 0 });
+        }
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 
-app.delete('/api/tasks/:id', (req, res) => {
+app.delete('/api/tasks/:id', async (req, res) => {
     const { id } = req.params;
-    db.run(`DELETE FROM tasks WHERE id = ?`, id, function(err) {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ deleted: this.changes });
-    });
+
+    try {
+        const result = await pool.query(`DELETE FROM tasks WHERE id = $1`, [id]);
+        res.json({ deleted: result.rowCount });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.listen(PORT, () => {
